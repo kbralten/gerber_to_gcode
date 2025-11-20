@@ -1,0 +1,8 @@
+# No external dependencies required
+# This project uses only Python standard library
+
+# Python 3.6 or higher is required for:
+# - f-strings
+# - Type hints (typing module)
+# - argparse
+# - math, re, sys modules

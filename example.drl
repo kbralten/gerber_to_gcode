@@ -1,0 +1,37 @@
+;FILE_FORMAT=4:4
+;Created by example for testing excellon_to_gcode.py
+;Units: Millimeters
+;Zero suppression: Leading zeros
+METRIC,LZ
+;
+;Tool definitions
+T01C0.8000
+T02C1.0000
+T03C3.0000
+T04C6.0000
+%
+;
+;Start drilling with T01 (0.8mm)
+T01
+X00100Y00100
+X00500Y00100
+X00900Y00100
+;
+;Switch to T02 (1.0mm)
+T02
+X00100Y00300
+X00500Y00300
+X00900Y00300
+;
+;Switch to T03 (3.0mm) - these will be spiral milled with 1mm bit
+T03
+X00100Y00500
+X00500Y00500
+X00900Y00500
+;
+;Switch to T04 (6.0mm) - larger holes for spiral milling demonstration
+T04
+X00300Y00700
+X00700Y00700
+;
+M30
