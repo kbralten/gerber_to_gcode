@@ -325,8 +325,13 @@ class ExcellonToGcode:
                 else:
                     gcode.append(f"G1 X{seg_x:.4f} Y{seg_y:.4f} F{self.feed_rate:.1f}")
         
-        # Return to center and retract
-        gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate:.1f} (Return to center)")
+        # Decide whether to return to center. If returning to center would
+        # require cutting across material (hole large compared to bit), skip
+        # the move and retract from the current tool position instead.
+        if hole_diameter <= 2 * self.bit_size:
+            gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate:.1f} (Return to center)")
+        else:
+            gcode.append("(Skipping return to center to avoid cutting; retracting from current position)")
         gcode.append(f"G0 Z{self.clearance_height:.3f} (Retract)")
         gcode.append("")
         
@@ -392,8 +397,13 @@ class ExcellonToGcode:
                 f"I{i_offset:.4f} J{j_offset:.4f} F{self.plunge_rate:.1f}"
             )
         
-        # Return to center and retract
-        gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate:.1f} (Return to center)")
+        # Decide whether to return to center. If returning to center would
+        # require cutting across material (hole large compared to bit), skip
+        # the move and retract from the current tool position instead.
+        if hole_diameter <= 2 * self.bit_size:
+            gcode.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate:.1f} (Return to center)")
+        else:
+            gcode.append("(Skipping return to center to avoid cutting; retracting from current position)")
         gcode.append(f"G0 Z{self.clearance_height:.3f} (Retract)")
         gcode.append("")
         
