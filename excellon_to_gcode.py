@@ -11,7 +11,20 @@ import argparse
 import math
 import re
 import sys
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
+
+# Optional imports for outline routing
+try:
+    from pygerber.gerberx3.tokenizer.tokenizer import Tokenizer
+    from pygerber.gerberx3.parser2.parser2 import Parser2
+    from pygerber.gerberx3.parser2.commands2.line2 import Line2
+    from pygerber.gerberx3.parser2.commands2.arc2 import Arc2
+    from pygerber.gerberx3.parser2.commands2.region2 import Region2
+    from shapely.geometry import LineString, Polygon, MultiPolygon
+    from shapely.ops import unary_union
+    GERBER_SUPPORT = True
+except ImportError:
+    GERBER_SUPPORT = False
 
 
 class ExcellonToGcode:
@@ -21,7 +34,7 @@ class ExcellonToGcode:
                  drill_depth: float, feed_rate: float = 100.0, 
                  plunge_rate: float = 50.0, spindle_speed: int = 10000,
                  safe_height: float = 5.0, clearance_height: float = 2.0,
-                 use_arcs: bool = False):
+                 use_arcs: bool = False, outline_file: Optional[str] = None):
         """
         Initialize the converter.
 
@@ -36,6 +49,7 @@ class ExcellonToGcode:
             safe_height: Safe Z height for rapid movements in mm
             clearance_height: Z clearance height above workpiece in mm
             use_arcs: Use G2/G3 arc moves instead of G1 line segments (default False)
+            outline_file: Optional path to Gerber outline file for board routing
         """
         self.input_file = input_file
         self.output_file = output_file
@@ -48,7 +62,9 @@ class ExcellonToGcode:
         self.safe_height = safe_height
         self.clearance_height = clearance_height
         self.use_arcs = use_arcs
+        self.outline_file = outline_file
         self.drill_holes: List[Tuple[float, float, float]] = []
+        self.outline_paths: List[List[Tuple[float, float]]] = []  # List of paths (outer and inner)
 
     def parse_excellon_file(self):
         """Parse Excellon drill file and extract drill hole information."""
@@ -210,6 +226,142 @@ class ExcellonToGcode:
             import traceback
             traceback.print_exc()
             sys.exit(1)
+
+    def parse_outline_file(self):
+        """Parse Gerber outline file and extract path contours."""
+        if not self.outline_file:
+            return
+        
+        if not GERBER_SUPPORT:
+            print("Warning: pygerber and shapely are required for outline routing")
+            print("Install with: pip install pygerber shapely")
+            return
+        
+        try:
+            print(f"\nParsing outline file '{self.outline_file}'...")
+            
+            with open(self.outline_file, 'r') as f:
+                source_code = f.read()
+            
+            # Tokenize and parse Gerber file
+            tokenizer = Tokenizer()
+            tokens = tokenizer.tokenize(source_code)
+            parser = Parser2()
+            command_buffer = parser.parse(tokens)
+            
+            # Extract paths from commands - build continuous paths
+            current_path = []
+            last_point = None
+            
+            for command in command_buffer.commands:
+                if isinstance(command, Line2):
+                    # Extract line coordinates
+                    x1 = command.start_point.x.as_millimeters()
+                    y1 = command.start_point.y.as_millimeters()
+                    x2 = command.end_point.x.as_millimeters()
+                    y2 = command.end_point.y.as_millimeters()
+                    
+                    # Check if this line connects to the previous path
+                    if last_point and (abs(last_point[0] - x1) > 0.001 or abs(last_point[1] - y1) > 0.001):
+                        # Discontinuity detected - save current path and start new one
+                        if current_path and len(current_path) >= 3:
+                            self.outline_paths.append(current_path)
+                        current_path = []
+                    
+                    # Add to current path
+                    if not current_path:
+                        current_path.append((x1, y1))
+                    current_path.append((x2, y2))
+                    last_point = (x2, y2)
+                    
+                elif isinstance(command, Arc2):
+                    # Approximate arc with line segments and add to current path
+                    x1 = command.start_point.x.as_millimeters()
+                    y1 = command.start_point.y.as_millimeters()
+                    x2 = command.end_point.x.as_millimeters()
+                    y2 = command.end_point.y.as_millimeters()
+                    cx = command.center_point.x.as_millimeters()
+                    cy = command.center_point.y.as_millimeters()
+                    
+                    # Check for discontinuity
+                    if last_point and (abs(last_point[0] - x1) > 0.001 or abs(last_point[1] - y1) > 0.001):
+                        if current_path and len(current_path) >= 3:
+                            self.outline_paths.append(current_path)
+                        current_path = []
+                    
+                    if not current_path:
+                        current_path.append((x1, y1))
+                    
+                    # Calculate arc parameters
+                    radius = math.sqrt((x1 - cx)**2 + (y1 - cy)**2)
+                    start_angle = math.atan2(y1 - cy, x1 - cx)
+                    end_angle = math.atan2(y2 - cy, x2 - cx)
+                    
+                    # Determine arc direction
+                    is_clockwise = getattr(command, 'is_clockwise', False)
+                    if is_clockwise:
+                        if end_angle > start_angle:
+                            end_angle -= 2 * math.pi
+                    else:
+                        if end_angle < start_angle:
+                            end_angle += 2 * math.pi
+                    
+                    # Generate arc points (skip first point as it's already in path)
+                    num_segments = max(8, int(abs(end_angle - start_angle) * radius * 2))
+                    for i in range(1, num_segments + 1):
+                        t = i / num_segments
+                        angle = start_angle + t * (end_angle - start_angle)
+                        px = cx + radius * math.cos(angle)
+                        py = cy + radius * math.sin(angle)
+                        current_path.append((px, py))
+                    last_point = (x2, y2)
+                    
+                elif isinstance(command, Region2):
+                    # Regions are separate contours, save current path and start new one
+                    if current_path and len(current_path) >= 3:
+                        self.outline_paths.append(current_path)
+                        current_path = []
+                    
+                    # Process region as a closed path
+                    region_points = []
+                    for segment in command.command_buffer.commands:
+                        if isinstance(segment, Line2):
+                            if not region_points:
+                                region_points.append((
+                                    segment.start_point.x.as_millimeters(),
+                                    segment.start_point.y.as_millimeters()
+                                ))
+                            region_points.append((
+                                segment.end_point.x.as_millimeters(),
+                                segment.end_point.y.as_millimeters()
+                            ))
+                        elif isinstance(segment, Arc2):
+                            # Handle arcs in regions (simplified)
+                            if not region_points:
+                                region_points.append((
+                                    segment.start_point.x.as_millimeters(),
+                                    segment.start_point.y.as_millimeters()
+                                ))
+                            region_points.append((
+                                segment.end_point.x.as_millimeters(),
+                                segment.end_point.y.as_millimeters()
+                            ))
+                    
+                    if region_points and len(region_points) >= 3:
+                        self.outline_paths.append(region_points)
+            
+            # Add any remaining path
+            if current_path and len(current_path) >= 3:
+                self.outline_paths.append(current_path)
+            
+            print(f"Parsed {len(self.outline_paths)} outline contour(s)")
+            
+        except FileNotFoundError:
+            print(f"Warning: Could not find outline file '{self.outline_file}'")
+        except Exception as e:
+            print(f"Warning: Failed to parse outline file: {e}")
+            import traceback
+            traceback.print_exc()
 
     def generate_gcode_header(self) -> List[str]:
         """Generate G-code header with initialization commands."""
@@ -409,10 +561,86 @@ class ExcellonToGcode:
         
         return gcode
 
+    def generate_outline_routing(self, path: List[Tuple[float, float]], is_outer: bool = True) -> List[str]:
+        """
+        Generate G-code for routing an outline path with tool offset.
+        
+        Args:
+            path: List of (x, y) coordinates defining the path
+            is_outer: True for outer contour (offset outward), False for inner (offset inward)
+            
+        Returns:
+            List of G-code commands
+        """
+        if not GERBER_SUPPORT or len(path) < 3:
+            return []
+        
+        gcode = [f"(Routing outline path: {len(path)} points, {'outer' if is_outer else 'inner'} contour)"]
+        
+        try:
+            # Create a polygon from the path
+            poly = Polygon(path)
+            
+            # Offset the polygon by tool radius
+            # Positive offset for outer contour (cut outside), negative for inner (cut inside)
+            offset_distance = self.bit_radius if is_outer else -self.bit_radius
+            offset_poly = poly.buffer(offset_distance, join_style=2)  # join_style=2 is mitre
+            
+            # Extract offset coordinates
+            if offset_poly.is_empty:
+                gcode.append("(Warning: Offset path is empty, skipping)")
+                return gcode
+            
+            # Get the exterior coordinates
+            if hasattr(offset_poly, 'exterior'):
+                offset_coords = list(offset_poly.exterior.coords)
+            else:
+                offset_coords = list(offset_poly.coords)
+            
+            if len(offset_coords) < 3:
+                gcode.append("(Warning: Offset path too short, skipping)")
+                return gcode
+            
+            # Calculate number of Z passes
+            z_step = 0.5  # mm per pass
+            num_passes = math.ceil(self.drill_depth / z_step)
+            z_step = self.drill_depth / num_passes
+            
+            # Move to start position
+            start_x, start_y = offset_coords[0]
+            gcode.append(f"G0 X{start_x:.4f} Y{start_y:.4f} (Move to path start)")
+            gcode.append(f"G0 Z{self.clearance_height:.3f} (Move to clearance height)")
+            
+            # Multiple Z passes
+            current_z = 0.0
+            for pass_num in range(num_passes):
+                current_z -= z_step
+                
+                # Plunge to depth
+                gcode.append(f"G1 Z{current_z:.4f} F{self.plunge_rate:.1f} (Pass {pass_num + 1}/{num_passes})")
+                
+                # Route the path
+                for i in range(1, len(offset_coords)):
+                    px, py = offset_coords[i]
+                    gcode.append(f"G1 X{px:.4f} Y{py:.4f} F{self.feed_rate:.1f}")
+                
+                # Return to start to close the loop
+                gcode.append(f"G1 X{start_x:.4f} Y{start_y:.4f} F{self.feed_rate:.1f} (Close path)")
+            
+            # Retract
+            gcode.append(f"G0 Z{self.clearance_height:.3f} (Retract)")
+            gcode.append("")
+            
+        except Exception as e:
+            gcode.append(f"(Error generating offset path: {e})")
+            print(f"Warning: Error offsetting path: {e}")
+        
+        return gcode
+
     def generate_gcode(self):
-        """Generate complete G-code file from parsed drill holes."""
-        if not self.drill_holes:
-            print("Error: No drill holes found in file")
+        """Generate complete G-code file from parsed drill holes and outline paths."""
+        if not self.drill_holes and not self.outline_paths:
+            print("Error: No drill holes or outline paths found")
             sys.exit(1)
 
         try:
@@ -421,35 +649,53 @@ class ExcellonToGcode:
                 for line in self.generate_gcode_header():
                     f.write(line + '\n')
 
-                # Process each hole
-                print(f"\nGenerating G-code for {len(self.drill_holes)} holes...")
-                
-                drill_count = 0
-                mill_count = 0
-                
-                for x, y, hole_diameter in self.drill_holes:
-                    if hole_diameter <= self.bit_size:
-                        # Straight drill for holes equal to or smaller than bit
-                        gcode = self.generate_straight_drill(x, y)
-                        drill_count += 1
-                    else:
-                        # Spiral mill for larger holes
-                        if self.use_arcs:
-                            gcode = self.generate_spiral_mill_arcs(x, y, hole_diameter)
-                        else:
-                            gcode = self.generate_spiral_mill(x, y, hole_diameter)
-                        mill_count += 1
+                # Process drill holes
+                if self.drill_holes:
+                    print(f"\nGenerating G-code for {len(self.drill_holes)} holes...")
                     
-                    for line in gcode:
-                        f.write(line + '\n')
+                    drill_count = 0
+                    mill_count = 0
+                    
+                    for x, y, hole_diameter in self.drill_holes:
+                        if hole_diameter <= self.bit_size:
+                            # Straight drill for holes equal to or smaller than bit
+                            gcode = self.generate_straight_drill(x, y)
+                            drill_count += 1
+                        else:
+                            # Spiral mill for larger holes
+                            if self.use_arcs:
+                                gcode = self.generate_spiral_mill_arcs(x, y, hole_diameter)
+                            else:
+                                gcode = self.generate_spiral_mill(x, y, hole_diameter)
+                            mill_count += 1
+                        
+                        for line in gcode:
+                            f.write(line + '\n')
+
+                    print(f"  Straight drilled: {drill_count} holes")
+                    print(f"  Spiral milled: {mill_count} holes")
+                
+                # Process outline paths
+                if self.outline_paths:
+                    print(f"\nGenerating G-code for {len(self.outline_paths)} outline path(s)...")
+                    
+                    for i, path in enumerate(self.outline_paths):
+                        # Determine if outer or inner contour based on path area
+                        # Larger area = outer contour, smaller = inner (slot/cutout)
+                        if GERBER_SUPPORT and len(path) >= 3:
+                            poly = Polygon(path)
+                            is_outer = (poly.area == max(Polygon(p).area for p in self.outline_paths if len(p) >= 3))
+                            gcode = self.generate_outline_routing(path, is_outer)
+                            for line in gcode:
+                                f.write(line + '\n')
+                    
+                    print(f"  Routed {len(self.outline_paths)} outline contour(s)")
 
                 # Write footer
                 for line in self.generate_gcode_footer():
                     f.write(line + '\n')
 
             print(f"\nG-code generation complete!")
-            print(f"  Straight drilled: {drill_count} holes")
-            print(f"  Spiral milled: {mill_count} holes")
             print(f"  Output file: {self.output_file}")
 
         except Exception as e:
@@ -463,6 +709,7 @@ class ExcellonToGcode:
         print("Excellon to G-code Converter")
         print("=" * 50)
         self.parse_excellon_file()
+        self.parse_outline_file()
         self.generate_gcode()
         print("\nConversion successful!")
 
@@ -545,6 +792,13 @@ Examples:
         action="store_true",
         help="Use G2/G3 arc moves for spiral milling (more compact output)"
     )
+    
+    parser.add_argument(
+        "--outline",
+        type=str,
+        default=None,
+        help="Optional Gerber outline file for board routing (.gbr)"
+    )
 
     args = parser.parse_args()
 
@@ -573,7 +827,8 @@ Examples:
         spindle_speed=args.spindle_speed,
         safe_height=args.safe_height,
         clearance_height=args.clearance_height,
-        use_arcs=args.use_arcs
+        use_arcs=args.use_arcs,
+        outline_file=args.outline
     )
     
     converter.convert()

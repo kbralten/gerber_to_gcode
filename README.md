@@ -5,10 +5,12 @@ Convert Excellon drill files to G-code for CNC milling machines. This tool intel
 ## Features
 
 - **Excellon Format Support**: Parses standard Excellon drill files with tool definitions, coordinates, and various format options
+- **Gerber Outline Routing**: Routes PCB outlines from Gerber files with automatic tool offset compensation
 - **Smart Drilling Strategy**: 
   - Straight plunge for holes ≤ bit size
   - Spiral milling for holes > bit size (accounts for bit radius)
 - **Arc Move Support**: Optional G2/G3 helical interpolation for compact G-code (85% smaller files!)
+- **Intelligent Offset**: Automatically offsets tool to outside of outer contours and inside of inner slots
 - **Metric and Imperial Units**: Automatically handles both METRIC and INCH files
 - **Zero Suppression**: Supports both LZ (leading zeros) and TZ (trailing zeros) formats
 - **Configurable Parameters**: Bit size, depth, feed rates, spindle speed, and more
@@ -16,12 +18,17 @@ Convert Excellon drill files to G-code for CNC milling machines. This tool intel
 
 ## Installation
 
-This is a standalone Python script with no external dependencies beyond Python 3.6+.
+**Dependencies:**
+- Python 3.6+
+- For outline routing: `pygerber>=2.0.0` and `shapely>=2.0.0`
 
 ```bash
 # Clone or download the repository
 git clone <repository-url>
 cd gerber_to_gcode
+
+# Install optional dependencies for outline routing
+pip install -r requirements.txt
 
 # Make the script executable (optional, Linux/Mac)
 chmod +x excellon_to_gcode.py
@@ -69,6 +76,29 @@ python excellon_to_gcode.py input.drl --use-arcs
 
 This creates **85% smaller files** by using arc moves instead of line segments for spiral milling!
 
+### Route PCB Outline
+
+Add board outline routing from a Gerber file:
+
+```bash
+python excellon_to_gcode.py input.drl --outline board_outline.gbr
+```
+
+The tool automatically:
+- Offsets the tool to the **outside** of the outermost contour
+- Offsets the tool to the **inside** of inner contours (slots/cutouts)
+- Routes in multiple passes based on the depth setting
+
+Combine with drilling and arc moves:
+
+```bash
+python excellon_to_gcode.py input.drl \
+  --outline board_outline.gbr \
+  --use-arcs \
+  --bit-size 1.0 \
+  --depth 1.6
+```
+
 ### Full Custom Parameters
 
 ```bash
@@ -88,6 +118,7 @@ python excellon_to_gcode.py input.drl \
 |--------|-------|------|---------|-------------|
 | `input_file` | - | str | required | Path to Excellon drill file |
 | `--output` | `-o` | str | input.nc | Output G-code file path |
+| `--outline` | - | str | none | Gerber outline file for routing |
 | `--bit-size` | `-b` | float | 1.0 | Milling bit diameter in mm |
 | `--depth` | `-d` | float | 2.0 | Drill/mill depth in mm |
 | `--feed-rate` | `-f` | float | 100.0 | XY feed rate in mm/min |
@@ -162,6 +193,26 @@ G0 Z2.000
 M5 (Stop spindle)
 M2 (End program)
 ```
+
+### Outline Routing
+
+When a Gerber outline file is provided with `--outline`, the tool:
+
+1. **Parses Gerber commands**: Extracts Line2, Arc2, and Region2 commands from the Gerber X3 file
+2. **Builds contours**: Detects discontinuities to separate outer board outline from inner slots/cutouts
+3. **Determines contour type**: Uses shapely to compute polygon area and orientation
+   - Largest contour = outer board outline → offset **outward** by tool radius
+   - Smaller contours = inner slots/cutouts → offset **inward** by tool radius
+4. **Multi-pass routing**: Routes each contour in multiple passes (0.5mm per pass) to reach full depth
+
+**Offset logic example:**
+- Board outline: 100mm × 80mm rectangle
+- Tool: 1.0mm diameter (0.5mm radius)
+- Outer path: (-0.5, -0.5) to (100.5, 80.5) - cuts **outside** the board
+- Inner slot: (20, 20) to (80, 60)
+- Inner path: (20.5, 20.5) to (79.5, 59.5) - cuts **inside** the slot
+
+This ensures the board is cut to the correct size and slots have the correct dimensions.
 
 ## Excellon File Format Support
 

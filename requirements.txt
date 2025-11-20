@@ -1,5 +1,6 @@
-# No external dependencies required
-# This project uses only Python standard library
+# Core dependencies for Gerber outline parsing
+pygerber>=2.0.0
+shapely>=2.0.0
 
 # Python 3.6 or higher is required for:
 # - f-strings

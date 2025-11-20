@@ -184,6 +184,34 @@ Trade-offs:
   Center entry: Less stress on first plunge
 ```
 
+## Offsetting Contour / Slot Routing
+
+When routing a board outline or internal slots from Gerber contours the tool must be offset so the finished part matches the Gerber geometry. The converter implements the following strategy:
+
+- Parse Gerber draw/region commands and build closed contours (Line2 / Arc2 / Region2). Detect discontinuities to separate multiple contours.
+- Compute polygon area for each contour (using shapely). The largest-area contour is assumed to be the outer board boundary; other contours are treated as inner cutouts/slots.
+- Compute tool radius: `r = bit_size / 2`.
+- Offset logic:
+  - Outer (board) contour: offset outward by `+r` (buffer positive) so the tool cuts outside the nominal outline and the finished board matches the Gerber outline.
+  - Inner contours (slots/cutouts): offset inward by `-r` (buffer negative) so the tool removes material inside the slot and the remaining slot width matches the Gerber outline.
+  - Implement offsets with `shapely.buffer(r)`; use appropriate `join_style`/`cap_style` if rounding or square corners are required.
+- Handle degenerate offsets: if `polygon.buffer(-r)` returns an empty geometry (feature too small for the chosen bit), warn and either skip, fallback to pocketing, or fall back to drilling depending on context.
+- Routing order and safety:
+  - Route inner contours (islands/slots) first, then route the outer contour last to avoid the board falling out during machining.
+  - Use multiple depth passes (same logic as spiral milling: divide total depth into conservative Z steps) when routing deep cuts.
+  - Start each contour with a rapid move to clearance height, plunge in at controlled plunge rate, execute the XY cut, then retract to clearance before moving to the next contour.
+
+Example (1.0 mm bit, outer 100×80mm, inner 60×40mm slot):
+
+- Tool radius = 0.5 mm
+- Outer offset → outer path coordinates move from `(0,0)-(100,80)` to `(-0.5,-0.5)-(100.5,80.5)` (cuts outside)
+- Inner offset → slot coordinates move from `(20,20)-(80,60)` to `(20.5,20.5)-(79.5,59.5)` (cuts inside)
+
+Notes:
+- For complex multi-polygons, treat each polygon separately and decide outer vs inner by comparing absolute areas.
+- When higher precision corners are required, adjust `buffer` parameters (join/cap resolution) or generate separate corner toolpaths instead of relying purely on `buffer()`.
+
+
 ## Common Issues & Solutions
 
 ### Issue: Hole too small
