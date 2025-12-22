@@ -170,6 +170,13 @@ The spiral milling accounts for the bit radius to ensure the final hole matches 
 - Linear segments: ~24 KB (37 G1 commands per circle pass)
 - Arc moves: ~3.7 KB (1 G2 command per circle pass) - **85% smaller!**
 
+### Slot Handling
+
+- **Detection**: The converter recognizes linear slots exported as paired rapid+linear moves (common in KiCad/Excellon drill exports) and records them as start/end centerlines.
+- **Interior Contour Routing**: For slots wider than the selected bit, the tool constructs a slot polygon from the centerline, offsets it inward by the bit radius, and routes the resulting interior contour(s) so the finished slot matches the requested width.
+- **Centerline Fallback**: For slots equal to or narrower than the bit (or when `shapely` is unavailable), the tool performs centerline multi-pass cutting along the slot centerline.
+- **Safety**: If interior offset yields an empty path (too small), the converter falls back to safe centerline passes.
+
 ### G-code Output
 
 Generated G-code includes:

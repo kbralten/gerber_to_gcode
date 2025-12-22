@@ -66,6 +66,7 @@ class ExcellonToGcode:
         self.outline_file = outline_file
         self.reset_origin_lower_left = reset_origin_lower_left
         self.drill_holes: List[Tuple[float, float, float]] = []
+        self.slots: List[Tuple[float, float, float, float, float]] = []  # start_x, start_y, end_x, end_y, diameter
         self.outline_paths: List[List[Tuple[float, float]]] = []  # List of paths (outer and inner)
 
     def parse_excellon_file(self):
@@ -86,6 +87,7 @@ class ExcellonToGcode:
             # Excellon header METRIC,LZ means leading zeros present, trailing zeros suppressed
             zero_mode = 'LZ'
 
+            last_rapid = None
             for line in lines:
                 line = line.strip()
 
@@ -207,6 +209,53 @@ class ExcellonToGcode:
 
                     diameter = tools[current_tool]
                     self.drill_holes.append((current_x, current_y, diameter))
+
+                # Also handle G-code style move pairs for slots (KiCad style in some drill exports)
+                # Example sequence in file:
+                # G00X128.0Y-94.0
+                # M15
+                # G01X128.0Y-91.0
+                # M16
+                # Match rapid move G00 but avoid matching G01 (which also starts with 'G0')
+                if line.startswith('G00') or (line.startswith('G0') and not line.startswith('G01')):
+                    # Rapid move to potential slot start
+                    mx = re.search(r'X([+-]?\d*\.?\d+)', line)
+                    my = re.search(r'Y([+-]?\d*\.?\d+)', line)
+                    if mx or my:
+                        try:
+                            rx = float(mx.group(1)) if mx else current_x
+                            ry = float(my.group(1)) if my else current_y
+                            # convert units if necessary
+                            if not metric:
+                                rx *= 25.4
+                                ry *= 25.4
+                            sd = tools.get(current_tool) if current_tool else None
+                            last_rapid = (rx, ry, current_tool, sd)
+                        except Exception:
+                            last_rapid = None
+                    else:
+                        last_rapid = None
+
+                elif line.startswith('G01') or (line.startswith('G1') and not line.startswith('G10')):
+                    # Linear move - if it's paired with a previous rapid (and wrapped by M15/M16), record as slot
+                    mx = re.search(r'X([+-]?\d*\.?\d+)', line)
+                    my = re.search(r'Y([+-]?\d*\.?\d+)', line)
+                    if mx or my:
+                        try:
+                            lx = float(mx.group(1)) if mx else current_x
+                            ly = float(my.group(1)) if my else current_y
+                            if not metric:
+                                lx *= 25.4
+                                ly *= 25.4
+                            # If we have a recorded rapid start, add a slot
+                            if last_rapid:
+                                sx, sy, _, sd = last_rapid
+                                if sd is None:
+                                    sd = tools.get(current_tool)
+                                self.slots.append((sx, sy, lx, ly, sd))
+                                last_rapid = None
+                        except Exception:
+                            pass
 
             print(f"\nParsed {len(self.drill_holes)} drill holes from '{self.input_file}'")
             
@@ -639,9 +688,116 @@ class ExcellonToGcode:
         
         return gcode
 
+    def generate_slot_routing(self, sx: float, sy: float, ex: float, ey: float, diameter: float) -> List[str]:
+        """
+        Generate G-code for routing a linear slot between two points using centerline multi-pass routing.
+
+        Args:
+            sx, sy: Start coordinate in mm
+            ex, ey: End coordinate in mm
+            diameter: Tool diameter used for the slot
+
+        Returns:
+            List of G-code commands
+        """
+        gcode: List[str] = [f"(Slot route: start=({sx:.3f},{sy:.3f}) end=({ex:.3f},{ey:.3f}) dia={diameter:.3f})"]
+
+        # Compute slot length and direction
+        dx = ex - sx
+        dy = ey - sy
+        length = math.hypot(dx, dy)
+        if length < 0.001:
+            gcode.append('(Warning: zero-length slot, skipping)')
+            return gcode
+
+        # Number of Z passes
+        z_step = 0.5
+        num_passes = math.ceil(self.drill_depth / z_step)
+        z_step = self.drill_depth / num_passes
+
+        # Unit vector along slot
+        ux = dx / length
+        uy = dy / length
+
+        # Starting and ending points are centerline of slot
+        start_x, start_y = sx, sy
+        end_x, end_y = ex, ey
+
+        # Slot width provided by Excellon entry
+        slot_width = diameter
+
+        # If we have shapely available and the slot is wider than the bit,
+        # construct the slot polygon and route the interior contour (slot minus bit radius).
+        if GERBER_SUPPORT and slot_width > self.bit_size + 1e-6:
+            try:
+                # Build slot polygon (centerline buffered by half slot width)
+                slot_line = LineString([(start_x, start_y), (end_x, end_y)])
+                slot_poly = slot_line.buffer(slot_width / 2.0, cap_style=1, join_style=1)
+
+                # Offset inward by bit radius to get tool center path(s)
+                inner_poly = slot_poly.buffer(-self.bit_radius, join_style=1)
+
+                if inner_poly.is_empty:
+                    # Fallback to centerline passes
+                    raise RuntimeError('Inner offset empty')
+
+                # Handle MultiPolygon or Polygon
+                polygons = []
+                if isinstance(inner_poly, MultiPolygon):
+                    polygons = list(inner_poly)
+                else:
+                    polygons = [inner_poly]
+
+                for poly in polygons:
+                    coords = list(poly.exterior.coords)
+                    if len(coords) < 3:
+                        continue
+
+                    # Route this contour with multiple Z passes
+                    gcode.append(f"(Routing interior contour with {len(coords)} points)")
+                    start_px, start_py = coords[0]
+                    gcode.append(f"G0 X{start_px:.4f} Y{start_py:.4f} (Move to contour start)")
+                    gcode.append(f"G0 Z{self.clearance_height:.3f} (Move to clearance height)")
+
+                    current_z = 0.0
+                    for p in range(num_passes):
+                        current_z -= z_step
+                        gcode.append(f"G1 Z{current_z:.4f} F{self.plunge_rate:.1f} (Pass {p+1}/{num_passes})")
+                        for i in range(1, len(coords)):
+                            px, py = coords[i]
+                            gcode.append(f"G1 X{px:.4f} Y{py:.4f} F{self.feed_rate:.1f}")
+                        # Close loop back to start
+                        gcode.append(f"G1 X{start_px:.4f} Y{start_py:.4f} F{self.feed_rate:.1f} (Close contour)")
+                        gcode.append(f"G0 Z{self.clearance_height:.3f}")
+
+                # Final retract
+                gcode.append(f"G0 Z{self.clearance_height:.3f} (Retract)")
+                gcode.append("")
+                return gcode
+            except Exception:
+                # If anything goes wrong with shapely, fall back to centerline routing
+                gcode.append('(Warning: interior contour routing failed, falling back to centerline)')
+
+        # Default/fallback: simple centerline multi-pass routing
+        gcode.append(f"G0 X{start_x:.4f} Y{start_y:.4f} (Move to slot start)")
+        gcode.append(f"G0 Z{self.clearance_height:.3f} (Move to clearance height)")
+
+        current_z = 0.0
+        for p in range(num_passes):
+            current_z -= z_step
+            gcode.append(f"G1 Z{current_z:.4f} F{self.plunge_rate:.1f} (Pass {p+1}/{num_passes})")
+            gcode.append(f"G1 X{end_x:.4f} Y{end_y:.4f} F{self.feed_rate:.1f}")
+            gcode.append(f"G0 Z{self.clearance_height:.3f}")
+            if p < num_passes - 1:
+                gcode.append(f"G0 X{start_x:.4f} Y{start_y:.4f}")
+
+        gcode.append(f"G0 Z{self.clearance_height:.3f} (Retract)")
+        gcode.append("")
+        return gcode
+
     def generate_gcode(self):
         """Generate complete G-code file from parsed drill holes and outline paths."""
-        if not self.drill_holes and not self.outline_paths:
+        if not self.drill_holes and not self.outline_paths and not self.slots:
             print("Error: No drill holes or outline paths found")
             sys.exit(1)
         try:
@@ -684,6 +840,14 @@ class ExcellonToGcode:
                         all_lines.extend(gcode)
 
                 print(f"  Routed {len(self.outline_paths)} outline contour(s)")
+
+            # Process detected slots (from Excellon/G-code style drill files)
+            if self.slots:
+                print(f"\nGenerating G-code for {len(self.slots)} slot(s)...")
+                for sx, sy, ex, ey, dia in self.slots:
+                    gcode = self.generate_slot_routing(sx, sy, ex, ey, dia)
+                    all_lines.extend(gcode)
+                print(f"  Routed {len(self.slots)} slot(s)")
 
             # Footer
             all_lines.extend(self.generate_gcode_footer())
