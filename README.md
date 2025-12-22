@@ -127,6 +127,7 @@ python excellon_to_gcode.py input.drl \
 | `--safe-height` | - | float | 5.0 | Safe Z height for rapid moves in mm |
 | `--clearance-height` | - | float | 2.0 | Z clearance above workpiece in mm |
 | `--use-arcs` | - | flag | false | Use G2/G3 arc moves (compact output) |
+| `--origin-lower-left` | - | flag | false | Shift all X/Y so lower-left of bounding box becomes (0,0) |
 
 ## How It Works
 
@@ -262,6 +263,8 @@ This file defines three tools (0.8mm, 1.0mm, 3.0mm) and drills 5 holes at specif
 4. **Spindle Speed**: Higher speeds (10000-20000 RPM) work well for small bits and PCB materials.
 
 5. **Multiple Passes**: The spiral milling uses 0.5mm Z steps by default. Adjust in the code if needed for your material.
+
+6. **Origin Reset**: If your PCB CAD places the board far from the sheet origin (KiCad "sheet coordinates"), use `--origin-lower-left` to translate all XY coordinates so the lower-left of the combined toolpath bounding box becomes `(0,0)`. This is useful to keep the machine origin near the workpiece and reduce long rapid travels.
 
 ## Troubleshooting
 
