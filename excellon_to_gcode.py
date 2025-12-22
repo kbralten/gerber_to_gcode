@@ -34,7 +34,8 @@ class ExcellonToGcode:
                  drill_depth: float, feed_rate: float = 100.0, 
                  plunge_rate: float = 50.0, spindle_speed: int = 10000,
                  safe_height: float = 5.0, clearance_height: float = 2.0,
-                 use_arcs: bool = False, outline_file: Optional[str] = None):
+                 use_arcs: bool = False, outline_file: Optional[str] = None,
+                 reset_origin_lower_left: bool = False):
         """
         Initialize the converter.
 
@@ -63,6 +64,7 @@ class ExcellonToGcode:
         self.clearance_height = clearance_height
         self.use_arcs = use_arcs
         self.outline_file = outline_file
+        self.reset_origin_lower_left = reset_origin_lower_left
         self.drill_holes: List[Tuple[float, float, float]] = []
         self.outline_paths: List[List[Tuple[float, float]]] = []  # List of paths (outer and inner)
 
@@ -642,57 +644,109 @@ class ExcellonToGcode:
         if not self.drill_holes and not self.outline_paths:
             print("Error: No drill holes or outline paths found")
             sys.exit(1)
-
         try:
-            with open(self.output_file, 'w') as f:
-                # Write header
-                for line in self.generate_gcode_header():
-                    f.write(line + '\n')
+            # Buffer all generated lines first so we can optionally shift origin
+            all_lines: List[str] = []
 
-                # Process drill holes
-                if self.drill_holes:
-                    print(f"\nGenerating G-code for {len(self.drill_holes)} holes...")
-                    
-                    drill_count = 0
-                    mill_count = 0
-                    
-                    for x, y, hole_diameter in self.drill_holes:
-                        if hole_diameter <= self.bit_size:
-                            # Straight drill for holes equal to or smaller than bit
-                            gcode = self.generate_straight_drill(x, y)
-                            drill_count += 1
+            # Header
+            all_lines.extend(self.generate_gcode_header())
+
+            # Process drill holes
+            if self.drill_holes:
+                print(f"\nGenerating G-code for {len(self.drill_holes)} holes...")
+                drill_count = 0
+                mill_count = 0
+
+                for x, y, hole_diameter in self.drill_holes:
+                    if hole_diameter <= self.bit_size:
+                        gcode = self.generate_straight_drill(x, y)
+                        drill_count += 1
+                    else:
+                        if self.use_arcs:
+                            gcode = self.generate_spiral_mill_arcs(x, y, hole_diameter)
                         else:
-                            # Spiral mill for larger holes
-                            if self.use_arcs:
-                                gcode = self.generate_spiral_mill_arcs(x, y, hole_diameter)
-                            else:
-                                gcode = self.generate_spiral_mill(x, y, hole_diameter)
-                            mill_count += 1
-                        
-                        for line in gcode:
-                            f.write(line + '\n')
+                            gcode = self.generate_spiral_mill(x, y, hole_diameter)
+                        mill_count += 1
+                    all_lines.extend(gcode)
 
-                    print(f"  Straight drilled: {drill_count} holes")
-                    print(f"  Spiral milled: {mill_count} holes")
-                
-                # Process outline paths
-                if self.outline_paths:
-                    print(f"\nGenerating G-code for {len(self.outline_paths)} outline path(s)...")
-                    
-                    for i, path in enumerate(self.outline_paths):
-                        # Determine if outer or inner contour based on path area
-                        # Larger area = outer contour, smaller = inner (slot/cutout)
-                        if GERBER_SUPPORT and len(path) >= 3:
-                            poly = Polygon(path)
-                            is_outer = (poly.area == max(Polygon(p).area for p in self.outline_paths if len(p) >= 3))
-                            gcode = self.generate_outline_routing(path, is_outer)
-                            for line in gcode:
-                                f.write(line + '\n')
-                    
-                    print(f"  Routed {len(self.outline_paths)} outline contour(s)")
+                print(f"  Straight drilled: {drill_count} holes")
+                print(f"  Spiral milled: {mill_count} holes")
 
-                # Write footer
-                for line in self.generate_gcode_footer():
+            # Process outline paths
+            if self.outline_paths:
+                print(f"\nGenerating G-code for {len(self.outline_paths)} outline path(s)...")
+
+                for i, path in enumerate(self.outline_paths):
+                    if GERBER_SUPPORT and len(path) >= 3:
+                        poly = Polygon(path)
+                        is_outer = (poly.area == max(Polygon(p).area for p in self.outline_paths if len(p) >= 3))
+                        gcode = self.generate_outline_routing(path, is_outer)
+                        all_lines.extend(gcode)
+
+                print(f"  Routed {len(self.outline_paths)} outline contour(s)")
+
+            # Footer
+            all_lines.extend(self.generate_gcode_footer())
+
+            # If requested, compute lower-left bounding box and shift X/Y coordinates
+            if self.reset_origin_lower_left:
+                # Find all X/Y coordinates in G-code (ignore comments in parentheses)
+                xs = []
+                ys = []
+                coord_re_x = re.compile(r'X([+-]?\d*\.?\d+)')
+                coord_re_y = re.compile(r'Y([+-]?\d*\.?\d+)')
+
+                for ln in all_lines:
+                    code_part = ln.split('(', 1)[0]  # drop comments in parentheses
+                    mx = coord_re_x.search(code_part)
+                    my = coord_re_y.search(code_part)
+                    if mx:
+                        try:
+                            xs.append(float(mx.group(1)))
+                        except ValueError:
+                            pass
+                    if my:
+                        try:
+                            ys.append(float(my.group(1)))
+                        except ValueError:
+                            pass
+
+                if xs and ys:
+                    min_x = min(xs)
+                    min_y = min(ys)
+                    dx = min_x
+                    dy = min_y
+
+                    def shift_line(line: str) -> str:
+                        # Keep comments intact
+                        parts = line.split('(', 1)
+                        code = parts[0]
+                        comment = '(' + parts[1] if len(parts) > 1 else ''
+
+                        # Replace X and Y occurrences with shifted values
+                        def repl_x(m):
+                            try:
+                                val = float(m.group(1)) - dx
+                                return f'X{val:.4f}'
+                            except Exception:
+                                return m.group(0)
+
+                        def repl_y(m):
+                            try:
+                                val = float(m.group(1)) - dy
+                                return f'Y{val:.4f}'
+                            except Exception:
+                                return m.group(0)
+
+                        code = coord_re_x.sub(repl_x, code)
+                        code = coord_re_y.sub(repl_y, code)
+                        return code + comment
+
+                    all_lines = [shift_line(ln) for ln in all_lines]
+
+            # Write out file
+            with open(self.output_file, 'w') as f:
+                for line in all_lines:
                     f.write(line + '\n')
 
             print(f"\nG-code generation complete!")
@@ -800,6 +854,12 @@ Examples:
         help="Optional Gerber outline file for board routing (.gbr)"
     )
 
+    parser.add_argument(
+        "--origin-lower-left",
+        action="store_true",
+        help="Reset origin to lower-left of bounding box around all movements (shift all X/Y so lower-left becomes 0,0)"
+    )
+
     args = parser.parse_args()
 
     # Auto-generate output filename if not specified
@@ -828,7 +888,8 @@ Examples:
         safe_height=args.safe_height,
         clearance_height=args.clearance_height,
         use_arcs=args.use_arcs,
-        outline_file=args.outline
+        outline_file=args.outline,
+        reset_origin_lower_left=args.origin_lower_left
     )
     
     converter.convert()
