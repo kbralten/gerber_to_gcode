@@ -18,7 +18,7 @@ try:
     from pygerber.gerberx3.tokenizer.tokenizer import Tokenizer
     from pygerber.gerberx3.parser2.parser2 import Parser2
     from pygerber.gerberx3.parser2.commands2.line2 import Line2
-    from pygerber.gerberx3.parser2.commands2.arc2 import Arc2
+    from pygerber.gerberx3.parser2.commands2.arc2 import Arc2, CCArc2
     from pygerber.gerberx3.parser2.commands2.region2 import Region2
     from shapely.geometry import LineString, Polygon, MultiPolygon
     from shapely.ops import unary_union
@@ -300,56 +300,36 @@ class ExcellonToGcode:
             parser = Parser2()
             command_buffer = parser.parse(tokens)
             
-            # Extract paths from commands - build continuous paths
-            current_path = []
-            last_point = None
+            # Tolerance for connecting segment endpoints (mm)
+            connect_tol = 0.05
+            
+            # First pass: collect all segments as (start_point, points_list, end_point)
+            # Each segment is stored as a list of points from start to end
+            segments = []
             
             for command in command_buffer.commands:
                 if isinstance(command, Line2):
-                    # Extract line coordinates
-                    x1 = command.start_point.x.as_millimeters()
-                    y1 = command.start_point.y.as_millimeters()
-                    x2 = command.end_point.x.as_millimeters()
-                    y2 = command.end_point.y.as_millimeters()
+                    x1 = float(command.start_point.x.as_millimeters())
+                    y1 = float(command.start_point.y.as_millimeters())
+                    x2 = float(command.end_point.x.as_millimeters())
+                    y2 = float(command.end_point.y.as_millimeters())
+                    segments.append([(x1, y1), (x2, y2)])
                     
-                    # Check if this line connects to the previous path
-                    if last_point and (abs(last_point[0] - x1) > 0.001 or abs(last_point[1] - y1) > 0.001):
-                        # Discontinuity detected - save current path and start new one
-                        if current_path and len(current_path) >= 3:
-                            self.outline_paths.append(current_path)
-                        current_path = []
-                    
-                    # Add to current path
-                    if not current_path:
-                        current_path.append((x1, y1))
-                    current_path.append((x2, y2))
-                    last_point = (x2, y2)
-                    
-                elif isinstance(command, Arc2):
-                    # Approximate arc with line segments and add to current path
-                    x1 = command.start_point.x.as_millimeters()
-                    y1 = command.start_point.y.as_millimeters()
-                    x2 = command.end_point.x.as_millimeters()
-                    y2 = command.end_point.y.as_millimeters()
-                    cx = command.center_point.x.as_millimeters()
-                    cy = command.center_point.y.as_millimeters()
-                    
-                    # Check for discontinuity
-                    if last_point and (abs(last_point[0] - x1) > 0.001 or abs(last_point[1] - y1) > 0.001):
-                        if current_path and len(current_path) >= 3:
-                            self.outline_paths.append(current_path)
-                        current_path = []
-                    
-                    if not current_path:
-                        current_path.append((x1, y1))
+                elif isinstance(command, (Arc2, CCArc2)):
+                    x1 = float(command.start_point.x.as_millimeters())
+                    y1 = float(command.start_point.y.as_millimeters())
+                    x2 = float(command.end_point.x.as_millimeters())
+                    y2 = float(command.end_point.y.as_millimeters())
+                    cx = float(command.center_point.x.as_millimeters())
+                    cy = float(command.center_point.y.as_millimeters())
                     
                     # Calculate arc parameters
                     radius = math.sqrt((x1 - cx)**2 + (y1 - cy)**2)
                     start_angle = math.atan2(y1 - cy, x1 - cx)
                     end_angle = math.atan2(y2 - cy, x2 - cx)
                     
-                    # Determine arc direction
-                    is_clockwise = getattr(command, 'is_clockwise', False)
+                    # Determine arc direction: Arc2 = clockwise (G02), CCArc2 = counter-clockwise (G03)
+                    is_clockwise = isinstance(command, Arc2) and not isinstance(command, CCArc2)
                     if is_clockwise:
                         if end_angle > start_angle:
                             end_angle -= 2 * math.pi
@@ -357,53 +337,126 @@ class ExcellonToGcode:
                         if end_angle < start_angle:
                             end_angle += 2 * math.pi
                     
-                    # Generate arc points (skip first point as it's already in path)
+                    # Generate arc points
+                    arc_points = [(x1, y1)]
                     num_segments = max(8, int(abs(end_angle - start_angle) * radius * 2))
                     for i in range(1, num_segments + 1):
                         t = i / num_segments
                         angle = start_angle + t * (end_angle - start_angle)
                         px = cx + radius * math.cos(angle)
                         py = cy + radius * math.sin(angle)
-                        current_path.append((px, py))
-                    last_point = (x2, y2)
+                        arc_points.append((px, py))
+                    segments.append(arc_points)
                     
                 elif isinstance(command, Region2):
-                    # Regions are separate contours, save current path and start new one
-                    if current_path and len(current_path) >= 3:
-                        self.outline_paths.append(current_path)
-                        current_path = []
-                    
                     # Process region as a closed path
                     region_points = []
                     for segment in command.command_buffer.commands:
                         if isinstance(segment, Line2):
+                            x1 = float(segment.start_point.x.as_millimeters())
+                            y1 = float(segment.start_point.y.as_millimeters())
+                            x2 = float(segment.end_point.x.as_millimeters())
+                            y2 = float(segment.end_point.y.as_millimeters())
                             if not region_points:
-                                region_points.append((
-                                    segment.start_point.x.as_millimeters(),
-                                    segment.start_point.y.as_millimeters()
-                                ))
-                            region_points.append((
-                                segment.end_point.x.as_millimeters(),
-                                segment.end_point.y.as_millimeters()
-                            ))
-                        elif isinstance(segment, Arc2):
-                            # Handle arcs in regions (simplified)
+                                region_points.append((x1, y1))
+                            region_points.append((x2, y2))
+                        elif isinstance(segment, (Arc2, CCArc2)):
+                            x1 = float(segment.start_point.x.as_millimeters())
+                            y1 = float(segment.start_point.y.as_millimeters())
+                            x2 = float(segment.end_point.x.as_millimeters())
+                            y2 = float(segment.end_point.y.as_millimeters())
+                            cx = float(segment.center_point.x.as_millimeters())
+                            cy = float(segment.center_point.y.as_millimeters())
+                            radius = math.sqrt((x1 - cx)**2 + (y1 - cy)**2)
+                            start_angle = math.atan2(y1 - cy, x1 - cx)
+                            end_angle = math.atan2(y2 - cy, x2 - cx)
+                            is_clockwise = isinstance(segment, Arc2) and not isinstance(segment, CCArc2)
+                            if is_clockwise:
+                                if end_angle > start_angle:
+                                    end_angle -= 2 * math.pi
+                            else:
+                                if end_angle < start_angle:
+                                    end_angle += 2 * math.pi
+                            num_segs = max(8, int(abs(end_angle - start_angle) * radius * 2))
                             if not region_points:
-                                region_points.append((
-                                    segment.start_point.x.as_millimeters(),
-                                    segment.start_point.y.as_millimeters()
-                                ))
-                            region_points.append((
-                                segment.end_point.x.as_millimeters(),
-                                segment.end_point.y.as_millimeters()
-                            ))
+                                region_points.append((x1, y1))
+                            for i in range(1, num_segs + 1):
+                                t = i / num_segs
+                                angle = start_angle + t * (end_angle - start_angle)
+                                px = cx + radius * math.cos(angle)
+                                py = cy + radius * math.sin(angle)
+                                region_points.append((px, py))
                     
                     if region_points and len(region_points) >= 3:
                         self.outline_paths.append(region_points)
             
-            # Add any remaining path
-            if current_path and len(current_path) >= 3:
-                self.outline_paths.append(current_path)
+            # Second pass: join segments into continuous contours by matching endpoints
+            def points_match(p1, p2, tol):
+                return math.hypot(p1[0] - p2[0], p1[1] - p2[1]) <= tol
+            
+            used = [False] * len(segments)
+            
+            while True:
+                # Find first unused segment to start a new contour
+                start_idx = None
+                for i, seg in enumerate(segments):
+                    if not used[i]:
+                        start_idx = i
+                        break
+                
+                if start_idx is None:
+                    break  # All segments used
+                
+                # Start building a contour from this segment
+                used[start_idx] = True
+                contour = list(segments[start_idx])
+                
+                # Keep trying to extend the contour
+                extended = True
+                while extended:
+                    extended = False
+                    contour_start = contour[0]
+                    contour_end = contour[-1]
+                    
+                    for i, seg in enumerate(segments):
+                        if used[i]:
+                            continue
+                        
+                        seg_start = seg[0]
+                        seg_end = seg[-1]
+                        
+                        # Try to append segment to end of contour
+                        if points_match(contour_end, seg_start, connect_tol):
+                            contour.extend(seg[1:])  # Skip first point (duplicate)
+                            used[i] = True
+                            extended = True
+                            break
+                        # Try to append reversed segment to end of contour
+                        elif points_match(contour_end, seg_end, connect_tol):
+                            contour.extend(reversed(seg[:-1]))  # Skip last point (duplicate)
+                            used[i] = True
+                            extended = True
+                            break
+                        # Try to prepend segment to start of contour
+                        elif points_match(contour_start, seg_end, connect_tol):
+                            contour = list(seg[:-1]) + contour  # Skip last point (duplicate)
+                            used[i] = True
+                            extended = True
+                            break
+                        # Try to prepend reversed segment to start of contour
+                        elif points_match(contour_start, seg_start, connect_tol):
+                            contour = list(reversed(seg[1:])) + contour  # Skip first point (duplicate)
+                            used[i] = True
+                            extended = True
+                            break
+                
+                # Check if contour is closed (start ~= end)
+                if len(contour) >= 3:
+                    if points_match(contour[0], contour[-1], connect_tol):
+                        # Remove duplicate closing point if present
+                        if len(contour) > 3:
+                            contour = contour[:-1]
+                    self.outline_paths.append(contour)
             
             print(f"Parsed {len(self.outline_paths)} outline contour(s)")
             
@@ -636,17 +689,26 @@ class ExcellonToGcode:
             # Positive offset for outer contour (cut outside), negative for inner (cut inside)
             offset_distance = self.bit_radius if is_outer else -self.bit_radius
             offset_poly = poly.buffer(offset_distance, join_style=2)  # join_style=2 is mitre
-            
-            # Extract offset coordinates
+
+            # Handle empty result
             if offset_poly.is_empty:
                 gcode.append("(Warning: Offset path is empty, skipping)")
                 return gcode
-            
-            # Get the exterior coordinates
-            if hasattr(offset_poly, 'exterior'):
-                offset_coords = list(offset_poly.exterior.coords)
+
+            # If buffer produced multiple polygons (islands), choose the largest by area
+            target_poly = None
+            if isinstance(offset_poly, MultiPolygon):
+                # Filter out very small artifacts and pick the largest polygon
+                polys = [p for p in offset_poly if p.area > 1e-6]
+                if not polys:
+                    gcode.append("(Warning: Offset produced only tiny islands, skipping)")
+                    return gcode
+                target_poly = max(polys, key=lambda p: p.area)
             else:
-                offset_coords = list(offset_poly.coords)
+                target_poly = offset_poly
+
+            # Extract exterior coordinates from the chosen polygon
+            offset_coords = list(target_poly.exterior.coords)
             
             if len(offset_coords) < 3:
                 gcode.append("(Warning: Offset path too short, skipping)")
@@ -828,19 +890,6 @@ class ExcellonToGcode:
                 print(f"  Straight drilled: {drill_count} holes")
                 print(f"  Spiral milled: {mill_count} holes")
 
-            # Process outline paths
-            if self.outline_paths:
-                print(f"\nGenerating G-code for {len(self.outline_paths)} outline path(s)...")
-
-                for i, path in enumerate(self.outline_paths):
-                    if GERBER_SUPPORT and len(path) >= 3:
-                        poly = Polygon(path)
-                        is_outer = (poly.area == max(Polygon(p).area for p in self.outline_paths if len(p) >= 3))
-                        gcode = self.generate_outline_routing(path, is_outer)
-                        all_lines.extend(gcode)
-
-                print(f"  Routed {len(self.outline_paths)} outline contour(s)")
-
             # Process detected slots (from Excellon/G-code style drill files)
             if self.slots:
                 print(f"\nGenerating G-code for {len(self.slots)} slot(s)...")
@@ -848,6 +897,40 @@ class ExcellonToGcode:
                     gcode = self.generate_slot_routing(sx, sy, ex, ey, dia)
                     all_lines.extend(gcode)
                 print(f"  Routed {len(self.slots)} slot(s)")
+
+            # Process outline paths: route inner cutouts/slots first, then outer board outline
+            if self.outline_paths:
+                print(f"\nGenerating G-code for {len(self.outline_paths)} outline path(s)...")
+
+                # Build polygons for valid paths
+                valid_paths = [p for p in self.outline_paths if len(p) >= 3]
+                if GERBER_SUPPORT and valid_paths:
+                    polys = [Polygon(p) for p in valid_paths]
+                    # Determine outermost contour by area
+                    areas = [poly.area for poly in polys]
+                    outer_idx = int(max(range(len(areas)), key=lambda i: areas[i]))
+
+                    # Route inner contours first
+                    inner_count = 0
+                    for idx, path in enumerate(valid_paths):
+                        if idx == outer_idx:
+                            continue
+                        gcode = self.generate_outline_routing(path, is_outer=False)
+                        all_lines.extend(gcode)
+                        inner_count += 1
+
+                    # Then route the outer contour
+                    outer_path = valid_paths[outer_idx]
+                    gcode = self.generate_outline_routing(outer_path, is_outer=True)
+                    all_lines.extend(gcode)
+
+                    print(f"  Routed {inner_count} inner contour(s) and 1 outer contour")
+                else:
+                    # Fallback: route in provided order
+                    for path in self.outline_paths:
+                        gcode = self.generate_outline_routing(path, True)
+                        all_lines.extend(gcode)
+                    print(f"  Routed {len(self.outline_paths)} outline contour(s)")
 
             # Footer
             all_lines.extend(self.generate_gcode_footer())
