@@ -35,7 +35,8 @@ class ExcellonToGcode:
                  plunge_rate: float = 50.0, spindle_speed: int = 10000,
                  safe_height: float = 5.0, clearance_height: float = 2.0,
                  use_arcs: bool = False, outline_file: Optional[str] = None,
-                 reset_origin_lower_left: bool = False):
+                 reset_origin_lower_left: bool = False,
+                 mirror_x: bool = False):
         """
         Initialize the converter.
 
@@ -51,6 +52,8 @@ class ExcellonToGcode:
             clearance_height: Z clearance height above workpiece in mm
             use_arcs: Use G2/G3 arc moves instead of G1 line segments (default False)
             outline_file: Optional path to Gerber outline file for board routing
+            reset_origin_lower_left: Reset origin to lower-left of bounding box
+            mirror_x: Mirror all coordinates in the X axis
         """
         self.input_file = input_file
         self.output_file = output_file
@@ -65,6 +68,7 @@ class ExcellonToGcode:
         self.use_arcs = use_arcs
         self.outline_file = outline_file
         self.reset_origin_lower_left = reset_origin_lower_left
+        self.mirror_x = mirror_x
         self.drill_holes: List[Tuple[float, float, float]] = []
         self.slots: List[Tuple[float, float, float, float, float]] = []  # start_x, start_y, end_x, end_y, diameter
         self.outline_paths: List[List[Tuple[float, float]]] = []  # List of paths (outer and inner)
@@ -1011,6 +1015,13 @@ class ExcellonToGcode:
         print("=" * 50)
         self.parse_excellon_file()
         self.parse_outline_file()
+        
+        if self.mirror_x:
+            print("\nApplying X-axis mirror...")
+            self.drill_holes = [(-x, y, d) for x, y, d in self.drill_holes]
+            self.slots = [(-sx, sy, -ex, ey, d) for sx, sy, ex, ey, d in self.slots]
+            self.outline_paths = [[(-x, y) for x, y in path] for path in self.outline_paths]
+            
         self.generate_gcode()
         print("\nConversion successful!")
 
@@ -1107,6 +1118,12 @@ Examples:
         help="Reset origin to lower-left of bounding box around all movements (shift all X/Y so lower-left becomes 0,0)"
     )
 
+    parser.add_argument(
+        "--mirror-x",
+        action="store_true",
+        help="Mirror all operations in the X axis (useful for bottom-up processing)"
+    )
+
     args = parser.parse_args()
 
     # Auto-generate output filename if not specified
@@ -1136,7 +1153,8 @@ Examples:
         clearance_height=args.clearance_height,
         use_arcs=args.use_arcs,
         outline_file=args.outline,
-        reset_origin_lower_left=args.origin_lower_left
+        reset_origin_lower_left=args.origin_lower_left,
+        mirror_x=args.mirror_x
     )
     
     converter.convert()
