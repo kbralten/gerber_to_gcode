@@ -128,6 +128,7 @@ python excellon_to_gcode.py input.drl \
 | `--clearance-height` | - | float | 2.0 | Z clearance above workpiece in mm |
 | `--use-arcs` | - | flag | false | Use G2/G3 arc moves (compact output) |
 | `--origin-lower-left` | - | flag | false | Shift all X/Y so lower-left of bounding box becomes (0,0) |
+| `--mirror-x` | - | flag | false | Mirror all operations in the X axis (useful for bottom-up processing) |
 
 ## How It Works
 
